@@ -12,6 +12,7 @@ import time
 from datetime import datetime, timezone, timedelta
 
 from tieba_client import TiebaClient
+import email_notify
 import wechat_notify
 
 BJ_TZ = timezone(timedelta(hours=8))
@@ -75,7 +76,8 @@ def sign_round(
     return failed
 
 
-def build_wechat_content(total: int, stats: dict) -> str:
+def build_content(total: int, stats: dict) -> str:
+    """构造推送正文（企业微信与邮件共用同一份内容）。"""
     date_str = datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
     lines = [
         "# 贴吧签到结果",
@@ -87,8 +89,33 @@ def build_wechat_content(total: int, stats: dict) -> str:
         f"- 签到失败：{stats['error']}",
     ]
     if stats["error"] > 0:
-        lines.append("> 存在签到失败的贴吧，请查看 Actions 运行日志")
+        lines.append("> 存在签到失败的贴吧，请查看运行日志")
     return "\n".join(lines)
+
+
+def build_subject(status: str) -> str:
+    """邮件主题，例如：贴吧签到结果 2026-10-27（成功 42 / 失败 0）。"""
+    return f"{status} {datetime.now(BJ_TZ).strftime('%Y-%m-%d')}"
+
+
+def notify_all(content: str, subject: str | None = None) -> None:
+    """把结果推送到所有已配置的通知渠道，未配置的渠道自动跳过。"""
+    channels = {
+        "企业微信": lambda: wechat_notify.send_markdown(content),
+        "邮件": lambda: email_notify.send_markdown(content, subject=subject),
+    }
+
+    sent = []
+    for name, send in channels.items():
+        try:
+            if send():
+                sent.append(name)
+        except Exception as e:  # 单个渠道异常不应影响其他渠道
+            logger.error(f"{name}通知发送异常: {e}")
+
+    logger.info(
+        f"通知发送完成: {'、'.join(sent) if sent else '无可用渠道（未配置 Webhook / 邮箱）'}"
+    )
 
 
 def main() -> None:
@@ -107,7 +134,10 @@ def main() -> None:
     forums = client.get_favorites()
     if not forums:
         logger.warning("未获取到关注的贴吧，签到结束")
-        wechat_notify.send_markdown("# 贴吧签到结果\n> 未获取到关注的贴吧，签到结束")
+        notify_all(
+            "# 贴吧签到结果\n> 未获取到关注的贴吧，签到结束",
+            subject=build_subject("贴吧签到结果（未获取到关注贴吧）"),
+        )
         return
 
     total = len(forums)
@@ -151,20 +181,27 @@ def main() -> None:
     summary.append("================================")
     logger.info("\n".join(summary))
 
-    wechat_notify.send_markdown(build_wechat_content(total, stats))
+    notify_all(
+        build_content(total, stats),
+        subject=build_subject(
+            f"贴吧签到结果（成功 {stats['success']} / 失败 {stats['error']}）"
+        ),
+    )
 
 
 if __name__ == "__main__":
     try:
         main()
     except SystemExit:
-        wechat_notify.send_markdown(
-            f"# 贴吧签到结果\n> {datetime.now(BJ_TZ)} 签到异常中断，请查看 Actions 运行日志"
+        notify_all(
+            f"# 贴吧签到结果\n> {datetime.now(BJ_TZ)} 签到异常中断，请查看运行日志",
+            subject=build_subject("贴吧签到异常中断"),
         )
         raise
     except Exception as e:
         logger.exception("签到过程发生未预期异常")
-        wechat_notify.send_markdown(
-            f"# 贴吧签到结果\n> {datetime.now(BJ_TZ)} 签到异常：{e}"
+        notify_all(
+            f"# 贴吧签到结果\n> {datetime.now(BJ_TZ)} 签到异常：{e}",
+            subject=build_subject("贴吧签到异常"),
         )
         raise
